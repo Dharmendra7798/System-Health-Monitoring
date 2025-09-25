@@ -2,73 +2,201 @@
 #Created by: Dharmendra Gupta
 #Created on: 25th Sep 2025
 
-LOG_FILE="/var/log/sys_health.log"
-REPORT_FILE="/tmp/sys_health_report.txt"
+set -u
 
-check_disk_usage() {
-    echo "------ Disk Usage ------"
-    df -h
-}
+# ----- Config (can be overridden by /etc/sys_health.conf or ~/.sys_health.conf) -----
+LOGFILE="/var/log/sys_health.log"
+CONFIG_GLOBAL="/etc/sys_health.conf"
+CONFIG_USER="$HOME/.sys_health.conf"
 
-check_running_services() {
-    echo "------ Running Services ------"
-    if command -v systemctl &> /dev/null; then
-        systemctl list-units --type=service --state=running
+# Defaults (change here or in config file)
+RECIPIENT="${RECIPIENT:-root@localhost}"
+ALERT_SERVICES="${ALERT_SERVICES:-sshd,nginx}"   # comma-separated list
+CRITICAL_DISK="${CRITICAL_DISK:-90}"            # percent threshold for alert
+
+# Load config files if present
+[ -f "$CONFIG_GLOBAL" ] && source "$CONFIG_GLOBAL"
+[ -f "$CONFIG_USER" ] && source "$CONFIG_USER"
+
+timestamp() { date +"%Y-%m-%d %H:%M:%S"; }
+
+ensure_logfile() {
+  if [ ! -e "$LOGFILE" ]; then
+    if [ "$(id -u)" -eq 0 ]; then
+      touch "$LOGFILE"
+      chmod 644 "$LOGFILE"
     else
-        service --status-all 2>/dev/null | grep '+'
+      echo "Warning: $LOGFILE does not exist and you are not root. Reports will print to STDOUT until logfile is created."
     fi
+  fi
 }
 
-check_memory_status() {
-    echo "------ Memory Status ------"
-    free -h
+log_line() {
+  local msg="$1"
+  if [ -w "$LOGFILE" ] || [ "$(id -u)" -eq 0 ]; then
+    echo "[$(timestamp)] $msg" >> "$LOGFILE"
+  else
+    echo "[$(timestamp)] $msg"
+  fi
 }
 
-check_cpu_performance() {
-    echo "------ CPU Performance ------"
-    top -b -n1 | head -n 10
+# ---------- Checks ----------
+check_disk() {
+  echo "=== Disk usage ==="
+  df -h
+  echo
+  echo "Partitions at/above ${CRITICAL_DISK}%:"
+  df -P | awk -v th="$CRITICAL_DISK" 'NR>1 {gsub(/%/,"",$5); if($5+0>=th) printf "%s -> %s%%\n",$6,$5}'
 }
 
+check_memory() {
+  echo "=== Memory status ==="
+  free -h
+  echo
+  echo "Top 5 memory consumers:"
+  ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%mem | head -n 6
+}
+
+check_cpu() {
+  echo "=== CPU / Load ==="
+  uptime
+  echo
+  echo "Top 5 CPU-consuming processes:"
+  ps -eo pid,cmd,%cpu --sort=-%cpu | head -n 6
+}
+
+check_services() {
+  echo "=== Running services ==="
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl list-units --type=service --state=running --no-pager --no-legend
+  else
+    # Fallback for non-systemd systems:
+    service --status-all 2>/dev/null || ps aux | head -n 20
+  fi
+
+  echo
+  echo "Checking important services (from ALERT_SERVICES):"
+  IFS=',' read -ra sarr <<< "$ALERT_SERVICES"
+  for s in "${sarr[@]}"; do
+    s="$(echo "$s" | xargs)"  # trim
+    [ -z "$s" ] && continue
+    if command -v systemctl >/dev/null 2>&1; then
+      if systemctl is-active --quiet "$s"; then status="running"; else status="not-running"; fi
+    else
+      if service "$s" status >/dev/null 2>&1; then status="running"; else status="not-running"; fi
+    fi
+    printf "%-20s : %s\n" "$s" "$status"
+  done
+}
+
+# Generate a full report, save to /tmp and optionally email and log
 generate_report() {
-    {
-        echo "===== System Health Report - $(date) ====="
-        check_disk_usage
-        echo
-        check_running_services
-        echo
-        check_memory_status
-        echo
-        check_cpu_performance
-        echo "========================================="
-    } > "$REPORT_FILE"
+  ensure_logfile
+  local outfile="/tmp/sys_health_report_$(date +%Y%m%d_%H%M%S).txt"
+  {
+    echo "=== System Health Report ==="
+    echo "Timestamp: $(timestamp)"
+    echo "Hostname : $(hostname)"
+    echo "Uptime   : $(uptime -p)"
+    echo "Kernel   : $(uname -sr)"
+    echo
+    check_disk
+    echo
+    check_memory
+    echo
+    check_cpu
+    echo
+    check_services
+  } > "$outfile"
 
-    # Log output
-    cat "$REPORT_FILE" >> "$LOG_FILE"
+  # Create a compact summary for the log
+  local loadavg="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "n/a")"
+  local free_mem="$(free -m | awk 'NR==2{printf "%sMB/%sMB",$4,$2}' 2>/dev/null || echo "n/a")"
+  local disk_alerts
+  disk_alerts="$(df -P | awk -v th="$CRITICAL_DISK" 'NR>1{gsub(/%/,"",$5); if($5+0>=th) printf "%s:%s%%,", $6, $5}' | sed 's/,$//')"
+  [ -z "$disk_alerts" ] && disk_alerts="none"
+
+  log_line "Report generated. loadavg:${loadavg} free_mem:${free_mem} disk_alerts:${disk_alerts}"
+
+  # Append full report to logfile if possible
+  if [ -w "$LOGFILE" ] || [ "$(id -u)" -eq 0 ]; then
+    cat "$outfile" >> "$LOGFILE"
+  fi
+
+  # Send email (best-effort)
+  if command -v mail >/dev/null 2>&1; then
+    mail -s "System Health Report: $(hostname) - $(date +"%Y-%m-%d %H:%M")" "$RECIPIENT" < "$outfile" && echo "Email sent to $RECIPIENT" || echo "Failed to send email with 'mail'"
+  elif command -v sendmail >/dev/null 2>&1; then
+    sed '1s/^/Subject: System Health Report\n/' "$outfile" | sendmail -t "$RECIPIENT" && echo "Email sent to $RECIPIENT via sendmail"
+  else
+    echo "No mail/sendmail found — install mailutils/mailx or configure msmtp. Report saved at $outfile"
+  fi
+
+  echo "Report saved to: $outfile"
 }
 
-display_menu() {
-    while true; do
-        echo -e "\nSystem Health Monitor Menu"
-        echo "1. Check Disk Usage"
-        echo "2. Check Running Services"
-        echo "3. Check Memory Status"
-        echo "4. Check CPU Performance"
-        echo "5. Exit"
-        read -rp "Enter choice [1-5]: " choice
-
-        case $choice in
-            1) check_disk_usage ;;
-            2) check_running_services ;;
-            3) check_memory_status ;;
-            4) check_cpu_performance ;;
-	    5) exit 0 ;;
-            *) echo "Invalid choice, try again." ;;
-        esac
-    done
+view_logs() {
+  if [ -f "$LOGFILE" ]; then
+    echo "---- Last 200 lines of $LOGFILE ----"
+    tail -n 200 "$LOGFILE"
+  else
+    echo "Log file $LOGFILE not found."
+  fi
 }
 
-# Ensure log file exists
-sudo touch "$LOG_FILE"
-sudo chmod 644 "$LOG_FILE"
+configure_recipient() {
+  echo "Current RECIPIENT: $RECIPIENT"
+  read -rp "Enter new email recipient (leave empty to keep current): " new
+  if [ -n "$new" ]; then
+    RECIPIENT="$new"
+    # Save to user config for persistence
+    echo "RECIPIENT=\"$RECIPIENT\"" > "$CONFIG_USER"
+    echo "Saved RECIPIENT in $CONFIG_USER"
+  fi
+}
 
-display_menu
+show_help() {
+  cat <<EOF
+Usage:
+  $0            -> interactive menu
+  $0 --report   -> generate report (non-interactive)
+  $0 --help     -> this help
+EOF
+}
+
+# ---------- CLI / Menu ----------
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  show_help
+  exit 0
+fi
+
+if [ "${1:-}" = "--report" ] || [ "${1:-}" = "-r" ]; then
+  generate_report
+  exit 0
+fi
+
+# interactive menu
+while true; do
+  echo
+  echo "System Health Monitor - menu"
+  echo "1) Check disk usage"
+  echo "2) Check memory"
+  echo "3) Check CPU / load"
+  echo "4) Check services"
+  echo "5) Generate full report (and email/log)"
+  echo "6) View logs"
+  echo "7) Configure email recipient"
+  echo "8) Exit"
+  read -rp "Choose [1-8]: " choice
+  case "$choice" in
+    1) check_disk ;;
+    2) check_memory ;;
+    3) check_cpu ;;
+    4) check_services ;;
+    5) generate_report ;;
+    6) view_logs ;;
+    7) configure_recipient ;;
+    8) echo "Bye."; break ;;
+    *) echo "Invalid choice" ;;
+  esac
+done
